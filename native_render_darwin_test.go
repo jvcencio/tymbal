@@ -114,5 +114,5 @@ func TestNativePublicRender(t *testing.T) {
 	}
 	t.Logf("coreaudio render: device=%q rate=%d period=%d periods=%d channels=%d format=%s latency_out=%s callbacks=%d dropouts=%d priority=%s",
 		output.Name, actual.SampleRate, actual.Period, actual.Periods, actual.OutChannels, actual.OutFormat, actual.LatencyOut,
-		stats.Callbacks, stats.Dropouts, actual.Priority)
+		stats.Callbacks, stats.Dropouts, stream.Actual().Priority) // not actual: the stream thread records its priority once Start has run
 }

@@ -50,12 +50,39 @@
 // that runs on the device's clock, so Go works a few periods ahead of it, the
 // depth of the ring, and the output latency includes that depth.
 //
+// # Thread priority
+//
+// Two threads matter, and only one of them needs raising.
+//
+// Core Audio's IO thread, the one that runs the render callback, belongs to the
+// HAL, which already schedules it in the real-time band. Measured on macOS 26,
+// Apple silicon, built-in speakers: a thread named
+// com.apple.audio.IOThread.client at priority 97, with a time-constraint policy
+// whose period, computation and constraint are all the device's IO cycle. This
+// package leaves it alone. It could not raise it from the callback in any case,
+// since that is assembly with no g and cannot call rt.Raise, and a policy of
+// our own would claim half a period of computation where the HAL claims all of
+// it.
+//
+// The Go stream thread is the one at risk. It sleeps on the semaphore and has
+// to wake, render a period and publish it before the ring runs dry. At the
+// ordinary timesharing priority, a wake that queues behind other work lets the
+// ring drain at small periods (128 frames and fewer), and the callback plays
+// silence for the shortfall, which Dropouts counts. The stream core raises
+// that thread itself: Stream.run locks it to an OS thread and calls rt.Raise
+// before Start, which on macOS applies a time-constraint policy of one period
+// (internal/rt, priority_darwin.go), and Lower undoes it after Stop. Nothing
+// in this package does that, and the priority granted is reported by the core
+// in Actual.Priority.
+//
 // # Status
 //
 // Output only, on the default or any other output device, at the device's
 // current nominal sample rate, as interleaved Float32. Not yet implemented:
-// input and duplex streams, device-change events (Watch), real-time thread
-// policy and the IO workgroup, and the ten-minute soak that gates them.
+// input and duplex streams, device-change events (Watch), the IO workgroup,
+// and the ten-minute soak that gates them. TestNativeRenderSoak in the root
+// package runs any shorter soak: TYMBAL_NATIVE_DURATION=60s at the default
+// 128-frame period.
 //
 // # Linking
 //
