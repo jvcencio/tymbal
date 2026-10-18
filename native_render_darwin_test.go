@@ -114,7 +114,7 @@ func TestNativePublicRender(t *testing.T) {
 	stream.Stats(&stats)
 	// Every observed period must be complete and represented in stream stats.
 	if callbacks.Load() < 20 || stats.Callbacks != callbacks.Load() || invalid.Load() {
-		t.Fatalf("incomplete render callbacks: observed=%d reported=%d invalid=%t", callbacks.Load(), stats.Callbacks, invalid.Load())
+		t.Fatalf("incomplete render callbacks: observed=%d reported=%d invalid=%t actual=%+v dropouts=%d wake_max=%s", callbacks.Load(), stats.Callbacks, invalid.Load(), stream.Actual(), stats.Dropouts, stats.WakeIntervalMax)
 	}
 	t.Logf("coreaudio render: device=%q rate=%d period=%d periods=%d channels=%d format=%s latency_out=%s callbacks=%d dropouts=%d priority=%s",
 		output.Name, actual.SampleRate, actual.Period, actual.Periods, actual.OutChannels, actual.OutFormat, actual.LatencyOut,
