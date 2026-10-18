@@ -91,7 +91,12 @@ func TestNativePublicRender(t *testing.T) {
 	if err := stream.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	// Shared CI runners can pause during race-instrumented startup. This is a
+	// progress/lifecycle check; the opt-in hardware soak owns dropout budgets.
+	deadline := time.Now().Add(3 * time.Second)
+	for callbacks.Load() < 20 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	for i := 0; i < 2; i++ {
 		if err := stream.Stop(); err != nil {
 			t.Fatalf("Stop %d: %v", i, err)
@@ -107,8 +112,7 @@ func TestNativePublicRender(t *testing.T) {
 	}
 	var stats tymbal.Stats
 	stream.Stats(&stats)
-	// Half a second at the granted period is dozens of callbacks even if the
-	// scheduler is unkind; 20 only rules out a stream that never ran.
+	// Every observed period must be complete and represented in stream stats.
 	if callbacks.Load() < 20 || stats.Callbacks != callbacks.Load() || invalid.Load() {
 		t.Fatalf("incomplete render callbacks: observed=%d reported=%d invalid=%t", callbacks.Load(), stats.Callbacks, invalid.Load())
 	}
