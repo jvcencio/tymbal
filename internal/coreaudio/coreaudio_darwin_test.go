@@ -76,8 +76,8 @@ func TestOpenRejectsWhatItCannotDo(t *testing.T) {
 		req  driver.Request
 		want error
 	}{
-		"input":       {driver.Request{Input: &out, InChannels: 1, SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrUnsupported},
-		"duplex":      {driver.Request{Output: &out, Input: &out, OutChannels: 2, InChannels: 1, SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrUnsupported},
+		"input":       {driver.Request{Input: &out, InChannels: 1, SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrLost},
+		"duplex":      {driver.Request{Output: &out, Input: &out, OutChannels: 2, InChannels: 1, SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrLost},
 		"no output":   {driver.Request{SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrUnsupported},
 		"exclusive":   {driver.Request{Output: &out, OutChannels: 2, SampleRate: 48000, Period: 128, Periods: 2, Exclusive: true}, driver.ErrUnsupported},
 		"no channels": {driver.Request{Output: &out, SampleRate: 48000, Period: 128, Periods: 2}, driver.ErrFormat},

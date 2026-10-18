@@ -16,16 +16,6 @@ import (
 	"m31labs.dev/tymbal/internal/driver"
 )
 
-// audioBufferList is AudioBufferList with its single AudioBuffer, as AUHAL
-// hands one to an interleaved render callback.
-type audioBufferList struct {
-	numberBuffers  uint32
-	_              uint32
-	numberChannels uint32
-	dataByteSize   uint32
-	data           uintptr
-}
-
 // callRender runs the real render trampoline on the calling thread through the
 // C ABI, the way Core Audio's IO thread does. dst's storage is Go memory, which
 // is fine here: the callee only uses it during the call.
@@ -292,13 +282,14 @@ func TestRenderBlocksSignals(t *testing.T) {
 		t.Errorf("masked = %d, want 1", s.c.masked)
 	}
 
-	// The mask is applied once: restore it, call again, and it stays restored.
+	// HAL can replace its IO thread. Restoring the original mask models a
+	// fresh foreign thread: every callback must block process signals again.
 	pthreadSigmask(3, &before, nil)
 	callRender(s.c, dst, 64, 2)
 	var again uint32
 	pthreadSigmask(1, nil, &again)
-	if again != before {
-		t.Errorf("second call changed the signal mask to %#x, want %#x", again, before)
+	if again != want {
+		t.Errorf("second call left the signal mask at %#x, want %#x", again, want)
 	}
 }
 

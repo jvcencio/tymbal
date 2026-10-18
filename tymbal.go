@@ -16,6 +16,7 @@ import (
 var (
 	ErrDeviceLost  = errors.New("tymbal: device lost")
 	ErrBusy        = errors.New("tymbal: device busy")
+	ErrPermission  = errors.New("tymbal: input access is not authorized")
 	ErrFormat      = errors.New("tymbal: no supported format")
 	ErrUnsupported = errors.New("tymbal: not supported by this host")
 	ErrCallback    = errors.New("tymbal: callback panicked")

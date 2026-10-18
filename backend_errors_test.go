@@ -56,6 +56,7 @@ func TestBackendFailuresUsePublicErrors(t *testing.T) {
 		{name: "changed format at start", startErr: driver.ErrFormat, want: ErrFormat},
 		{name: "device lost during commit", commitErr: driver.ErrLost, want: ErrDeviceLost},
 		{name: "device lost during close", closeErr: driver.ErrLost, want: ErrDeviceLost},
+		{name: "input permission revoked", commitErr: driver.ErrPermission, want: ErrPermission},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h, _ := NewFakeHost(FakeConfig{})

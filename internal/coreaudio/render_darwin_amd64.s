@@ -38,10 +38,7 @@ TEXT ·render(SB), NOSPLIT|NOFRAME, $0-0
 	MOVQ	R9, R12			// ioData
 	MOVL	R8, R14			// nframes
 
-	// First call: block process signals on this thread (see blockedSignals).
-	MOVQ	ctrl_masked(BX), AX
-	TESTQ	AX, AX
-	JNE	masked
+	// Block process signals on every callback: HAL may replace its IO thread (see blockedSignals).
 	MOVQ	ctrl_sigmask(BX), AX
 	TESTQ	AX, AX
 	JEQ	masked

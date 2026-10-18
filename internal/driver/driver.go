@@ -3,6 +3,7 @@
 package driver
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -26,6 +27,25 @@ var ErrFormat = errors.New("tymbal driver: unsupported format or period")
 
 // ErrUnsupported reports a backend mode that has not been implemented.
 var ErrUnsupported = errors.New("tymbal driver: unsupported mode")
+
+var ErrPermission = errors.New("tymbal driver: input access is not authorized")
+
+type InputAccess string
+
+const (
+	InputAccessGranted     InputAccess = "granted"
+	InputAccessPrompt      InputAccess = "prompt"
+	InputAccessDenied      InputAccess = "denied"
+	InputAccessRestricted  InputAccess = "restricted"
+	InputAccessUnavailable InputAccess = "unavailable"
+)
+
+// InputAccessController belongs to the control path. Opening a stream never
+// displays a permission dialog; applications request access after user intent.
+type InputAccessController interface {
+	InputAccess() (InputAccess, error)
+	RequestInputAccess(context.Context) error
+}
 
 // Info describes a device without referring to the public package.
 type Info struct {

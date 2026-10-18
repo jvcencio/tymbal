@@ -39,11 +39,12 @@ var (
 
 // streamConfig is the negotiated geometry newStream builds a stream from.
 type streamConfig struct {
-	rate       int
-	channels   int
-	period     int // frames per Go render period
-	fill       int // frames kept queued ahead of Core Audio; a multiple of period
-	pipeFrames int // frames between the ring and the speaker: device buffer, latencies, safety offset
+	rate                                                        int
+	channels                                                    int
+	period                                                      int // frames per Go render period
+	fill                                                        int // frames kept queued ahead of Core Audio; a multiple of period
+	inputChannels, inputPipeFrames, maxInputFrames, inputOffset int
+	pipeFrames                                                  int // frames between the ring and the speaker: device buffer, latencies, safety offset
 }
 
 // stream is one output stream: a ring in an arena, a Mach semaphore, and,
@@ -87,6 +88,11 @@ type stream struct {
 	closed  atomic.Bool
 	ready   bool // Wait succeeded and Commit has not run
 
+	input                                     *inputCapture
+	inputDevice, outputDevice, ownedAggregate uint32
+	inputOffset                               int
+	inputDenied                               atomic.Bool
+
 	finalUnder uint64 // Dropouts as of Close, which unmaps the counters
 }
 
@@ -104,7 +110,7 @@ func nextPow2(n int) int {
 // nothing and talks to no audio device, so the whole producer/consumer
 // protocol can run against a stand-in for Core Audio (see render_darwin_test.go).
 func newStream(cfg streamConfig) (*stream, error) {
-	if cfg.rate <= 0 || cfg.channels <= 0 || cfg.channels > maxChannels ||
+	if cfg.rate <= 0 || cfg.channels < 0 || cfg.channels > maxChannels || cfg.inputChannels < 0 || cfg.inputChannels > maxChannels || cfg.channels+cfg.inputChannels == 0 ||
 		cfg.period <= 0 || cfg.fill < cfg.period || cfg.fill%cfg.period != 0 || cfg.pipeFrames < 0 {
 		return nil, errRingGeometry
 	}
@@ -148,7 +154,9 @@ func newStream(cfg streamConfig) (*stream, error) {
 	c := s.c
 	c.mask = uint64(capacity - 1)
 	c.fbytes = uint64(frameBytes)
-	c.data = uintptr(unsafe.Pointer(&data[0]))
+	if len(data) > 0 {
+		c.data = uintptr(unsafe.Pointer(&data[0]))
+	}
 	c.sem = uint64(sem)
 	c.signal = fnsemaphore_signal
 	c.memcpy = fnmemcpy
@@ -160,6 +168,21 @@ func newStream(cfg streamConfig) (*stream, error) {
 		SampleRate: cfg.rate, Period: cfg.period, Periods: cfg.fill / cfg.period,
 		OutChannels: cfg.channels, OutFormat: format.F32LE,
 		LatencyOut: time.Duration(int64(cfg.fill+cfg.pipeFrames) * int64(time.Second) / int64(cfg.rate)),
+	}
+	if cfg.channels == 0 {
+		s.params.OutFormat = ""
+		s.params.LatencyOut = 0
+	}
+	if cfg.inputChannels > 0 {
+		maxFrames := max(4096, cfg.maxInputFrames, cfg.period)
+		input, err := newInputCapture(cfg.inputChannels, cfg.period, max(cfg.fill, maxFrames), maxFrames, sem)
+		if err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+		s.input, s.inputOffset = input, cfg.inputOffset
+		s.params.InChannels, s.params.InFormat = cfg.inputChannels, format.F32LE
+		s.params.LatencyIn = time.Duration(int64(cfg.inputPipeFrames) * int64(time.Second) / int64(cfg.rate))
 	}
 	return s, nil
 }
@@ -175,16 +198,22 @@ type streamDescription struct {
 type renderCallback struct{ proc, refcon uintptr }
 
 const (
-	unitTypeOutput   = 'a'<<24 | 'u'<<16 | 'o'<<8 | 'u' // kAudioUnitType_Output
-	unitSubTypeHAL   = 'a'<<24 | 'h'<<16 | 'a'<<8 | 'l' // kAudioUnitSubType_HALOutput
-	unitManufApple   = 'a'<<24 | 'p'<<16 | 'p'<<8 | 'l' // kAudioUnitManufacturer_Apple
-	formatLinearPCM  = 'l'<<24 | 'p'<<16 | 'c'<<8 | 'm' // kAudioFormatLinearPCM
-	formatFloatPack  = 0x1 | 0x8                        // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked: interleaved
-	propCurrentDev   = 2000                             // kAudioOutputUnitProperty_CurrentDevice
-	propStreamFormat = 8                                // kAudioUnitProperty_StreamFormat
-	propSetRender    = 23                               // kAudioUnitProperty_SetRenderCallback
-	unitScopeGlobal  = 0
-	unitScopeInput   = 1
+	unitTypeOutput     = 'a'<<24 | 'u'<<16 | 'o'<<8 | 'u' // kAudioUnitType_Output
+	unitSubTypeHAL     = 'a'<<24 | 'h'<<16 | 'a'<<8 | 'l' // kAudioUnitSubType_HALOutput
+	unitManufApple     = 'a'<<24 | 'p'<<16 | 'p'<<8 | 'l' // kAudioUnitManufacturer_Apple
+	formatLinearPCM    = 'l'<<24 | 'p'<<16 | 'c'<<8 | 'm' // kAudioFormatLinearPCM
+	formatFloatPack    = 0x1 | 0x8                        // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked: interleaved
+	propEnableIO       = 2003
+	propInputCallback  = 2005
+	propChannelMap     = 2002
+	propMaxFrames      = 14
+	propAllocateBuffer = 51
+	unitScopeOutput    = 2
+	propCurrentDev     = 2000 // kAudioOutputUnitProperty_CurrentDevice
+	propStreamFormat   = 8    // kAudioUnitProperty_StreamFormat
+	propSetRender      = 23   // kAudioUnitProperty_SetRenderCallback
+	unitScopeGlobal    = 0
+	unitScopeInput     = 1
 )
 
 // attachUnit creates the AUHAL output unit for device, gives it an interleaved
@@ -206,34 +235,86 @@ func (s *stream) attachUnit(device uint32) error {
 	}
 	s.unit, s.device = unit, device
 
+	if s.input != nil {
+		enabled := uint32(1)
+		if err := check("AudioUnitSetProperty(EnableInput)", audioUnitSetProperty(unit, propEnableIO, unitScopeInput, 1, unsafe.Pointer(&enabled), 4)); err != nil {
+			return err
+		}
+		if s.params.OutChannels == 0 {
+			enabled = 0
+			if err := check("AudioUnitSetProperty(DisableOutput)", audioUnitSetProperty(unit, propEnableIO, unitScopeOutput, 0, unsafe.Pointer(&enabled), 4)); err != nil {
+				return err
+			}
+		}
+	}
 	dev := device
 	if err := check("AudioUnitSetProperty(CurrentDevice)",
 		audioUnitSetProperty(unit, propCurrentDev, unitScopeGlobal, 0, unsafe.Pointer(&dev), 4)); err != nil {
 		return err
 	}
-	asbd := streamDescription{
-		sampleRate:       float64(s.rate),
-		formatID:         formatLinearPCM,
-		formatFlags:      formatFloatPack,
-		bytesPerPacket:   uint32(s.frameBytes),
-		framesPerPacket:  1,
-		bytesPerFrame:    uint32(s.frameBytes),
-		channelsPerFrame: uint32(s.params.OutChannels),
-		bitsPerChannel:   bytesPerSample * 8,
+	if s.params.OutChannels > 0 {
+		asbd := streamDescription{
+			sampleRate:       float64(s.rate),
+			formatID:         formatLinearPCM,
+			formatFlags:      formatFloatPack,
+			bytesPerPacket:   uint32(s.frameBytes),
+			framesPerPacket:  1,
+			bytesPerFrame:    uint32(s.frameBytes),
+			channelsPerFrame: uint32(s.params.OutChannels),
+			bitsPerChannel:   bytesPerSample * 8,
+		}
+		if err := check("AudioUnitSetProperty(StreamFormat)",
+			audioUnitSetProperty(unit, propStreamFormat, unitScopeInput, 0, unsafe.Pointer(&asbd), uint32(unsafe.Sizeof(asbd)))); err != nil {
+			return err
+		}
+		cb := renderCallback{proc: renderABI0, refcon: uintptr(unsafe.Pointer(s.c))}
+		if err := check("AudioUnitSetProperty(SetRenderCallback)",
+			audioUnitSetProperty(unit, propSetRender, unitScopeInput, 0, unsafe.Pointer(&cb), uint32(unsafe.Sizeof(cb)))); err != nil {
+			return err
+		}
 	}
-	if err := check("AudioUnitSetProperty(StreamFormat)",
-		audioUnitSetProperty(unit, propStreamFormat, unitScopeInput, 0, unsafe.Pointer(&asbd), uint32(unsafe.Sizeof(asbd)))); err != nil {
-		return err
-	}
-	cb := renderCallback{proc: renderABI0, refcon: uintptr(unsafe.Pointer(s.c))}
-	if err := check("AudioUnitSetProperty(SetRenderCallback)",
-		audioUnitSetProperty(unit, propSetRender, unitScopeInput, 0, unsafe.Pointer(&cb), uint32(unsafe.Sizeof(cb)))); err != nil {
-		return err
+	if s.input != nil {
+		in := s.input
+		in.c.unit = unit
+		asbd := streamDescription{sampleRate: float64(s.rate), formatID: formatLinearPCM, formatFlags: formatFloatPack, bytesPerPacket: uint32(in.c.frameBytes), framesPerPacket: 1, bytesPerFrame: uint32(in.c.frameBytes), channelsPerFrame: uint32(s.params.InChannels), bitsPerChannel: 32}
+		if err := check("AudioUnitSetProperty(InputFormat)", audioUnitSetProperty(unit, propStreamFormat, unitScopeOutput, 1, unsafe.Pointer(&asbd), uint32(unsafe.Sizeof(asbd)))); err != nil {
+			return err
+		}
+		channelMap := make([]int32, s.params.InChannels)
+		for i := range channelMap {
+			channelMap[i] = int32(s.inputOffset + i)
+		}
+		if err := check("AudioUnitSetProperty(InputChannels)", audioUnitSetProperty(unit, propChannelMap, unitScopeOutput, 1, unsafe.Pointer(&channelMap[0]), uint32(len(channelMap)*4))); err != nil {
+			return err
+		}
+		maxFrames := uint32(in.c.maxFrames)
+		if err := check("AudioUnitSetProperty(MaximumFrames)", audioUnitSetProperty(unit, propMaxFrames, unitScopeGlobal, 0, unsafe.Pointer(&maxFrames), 4)); err != nil {
+			return err
+		}
+		allocate := uint32(0)
+		if err := check("AudioUnitSetProperty(InputBuffer)", audioUnitSetProperty(unit, propAllocateBuffer, unitScopeOutput, 1, unsafe.Pointer(&allocate), 4)); err != nil {
+			return err
+		}
+		cb := renderCallback{proc: captureABI0, refcon: uintptr(unsafe.Pointer(in.c))}
+		if err := check("AudioUnitSetProperty(InputCallback)", audioUnitSetProperty(unit, propInputCallback, unitScopeGlobal, 0, unsafe.Pointer(&cb), uint32(unsafe.Sizeof(cb)))); err != nil {
+			return err
+		}
+
 	}
 	if err := check("AudioUnitInitialize", audioUnitInitialize(unit)); err != nil {
 		return err
 	}
 	s.initialized = true
+	if s.input != nil {
+		var actual streamDescription
+		size := uint32(unsafe.Sizeof(actual))
+		if err := check("AudioUnitGetProperty(InputFormat)", audioUnitGetProperty(unit, propStreamFormat, unitScopeOutput, 1, unsafe.Pointer(&actual), &size)); err != nil {
+			return err
+		}
+		if actual.sampleRate != float64(s.rate) || actual.channelsPerFrame != uint32(s.params.InChannels) || actual.bytesPerFrame != uint32(s.input.c.frameBytes) || actual.formatID != formatLinearPCM || actual.formatFlags&formatFloatPack != formatFloatPack || actual.formatFlags&2 != 0 {
+			return fmt.Errorf("%w: Core Audio changed the requested input format", driver.ErrFormat)
+		}
+	}
 	return nil
 }
 
@@ -248,7 +329,9 @@ func (s *stream) Start() error {
 		return errState
 	}
 	// The ring is still all zeros: this is silence.
-	s.head = s.fillMax
+	if s.params.OutChannels > 0 {
+		s.head = s.fillMax
+	}
 	atomic.StoreUint64(&s.c.head, s.head)
 	if s.unit != 0 {
 		if err := check("AudioOutputUnitStart", audioOutputUnitStart(s.unit)); err != nil {
@@ -273,13 +356,27 @@ func (s *stream) Wait() error {
 		return errWaitCommit
 	}
 	for {
+		if s.inputDenied.Load() {
+			return errMicrophoneAccess
+		}
 		if s.deviceLost.Load() {
 			return driver.ErrLost
 		}
 		if s.interrupted.Load() {
 			return driver.ErrInterrupted
 		}
-		if s.fillMax-(s.head-atomic.LoadUint64(&s.c.tail)) >= s.periodMax {
+		if s.input != nil {
+			if err := s.input.waitError(); err != nil {
+				return err
+			}
+		}
+		outputReady := s.params.OutChannels == 0 || s.fillMax-(s.head-atomic.LoadUint64(&s.c.tail)) >= s.periodMax
+		if outputReady && (s.input == nil || s.input.available()) {
+			if s.input != nil {
+				if err := s.input.read(s.rate); err != nil {
+					return err
+				}
+			}
 			s.ready = true
 			return nil
 		}
@@ -316,8 +413,17 @@ func (s *stream) startDeviceWatch() {
 			case <-s.watchStop:
 				return
 			case <-ticker.C:
+				if s.input != nil {
+					access, err := nativeInputAccess()
+					if err != nil || access != driver.InputAccessGranted {
+						s.inputDenied.Store(true)
+						semaphoreSignal(s.sem)
+						return
+					}
+				}
 				if s.deviceGone() {
 					s.deviceLost.Store(true)
+					semaphoreSignal(s.sem)
 					return
 				}
 			}
@@ -327,17 +433,21 @@ func (s *stream) startDeviceWatch() {
 
 // deviceGone asks Core Audio whether the attached device has disappeared.
 func (s *stream) deviceGone() bool {
-	if s.device == 0 {
-		return false
-	}
-	var alive uint32
-	size := uint32(4)
-	status := audioObjectGetPropertyData(s.device, selDeviceIsAlive, scopeGlobal, &size, unsafe.Pointer(&alive))
-	switch status {
-	case 0:
-		return alive == 0
-	case statusBadDevice, statusBadObject:
-		return true
+	for _, device := range [3]uint32{s.device, s.inputDevice, s.outputDevice} {
+		if device == 0 {
+			continue
+		}
+		var alive uint32
+		size := uint32(4)
+		status := audioObjectGetPropertyData(device, selDeviceIsAlive, scopeGlobal, &size, unsafe.Pointer(&alive))
+		if status == statusBadDevice || status == statusBadObject || status == 0 && alive == 0 {
+			return true
+		}
+		// A rate change invalidates the take's negotiated frame geometry. End
+		// the stream rather than writing newly timed samples into the old rate.
+		if rate, err := f64Prop(device, selNominalSampleRate, scopeGlobal); err == nil && int(rate+0.5) != s.rate {
+			return true
+		}
 	}
 	return false
 }
@@ -354,10 +464,15 @@ func (s *stream) Interrupt() {
 	s.wakeMu.Unlock()
 }
 
-// Buffers returns the one-period staging buffer. There is no input.
+// Buffers returns complete input and output periods in client staging storage.
 //
 //tymbal:rt
-func (s *stream) Buffers() (in, out []byte) { return nil, s.out }
+func (s *stream) Buffers() (in, out []byte) {
+	if s.input != nil {
+		in = s.input.staging
+	}
+	return in, s.out
+}
 
 // Commit copies the staged period into the ring, in two pieces when it wraps,
 // and publishes it to the render callback.
@@ -368,6 +483,9 @@ func (s *stream) Commit() error {
 		return errState
 	}
 	s.ready = false
+	if s.params.OutChannels == 0 {
+		return nil
+	}
 	fb := uint64(s.frameBytes)
 	capacity := s.c.mask + 1
 	idx := s.head & s.c.mask
@@ -388,15 +506,22 @@ func (s *stream) Commit() error {
 // Clock estimates when the first frame of the period about to be committed
 // will be heard: the frames still queued ahead of it in the ring, plus the
 // device pipeline, from now. It does not know how far into the current IO
-// cycle Core Audio is, so it can be off by up to one device buffer.
+// cycle Core Audio is, so output can be off by up to one device buffer. Input
+// uses the native timestamp of the first captured frame, in rt.Now's domain.
 //
 //tymbal:rt
 func (s *stream) Clock() (outNano, inNano int64) {
 	if s.closed.Load() {
 		return 0, 0
 	}
-	ahead := int64(s.head-atomic.LoadUint64(&s.c.tail)) + int64(s.pipeFrames)
-	return rt.Now() + ahead*int64(time.Second)/int64(s.rate), 0
+	if s.input != nil {
+		inNano = s.input.pending.InputQPCNano
+	}
+	if s.params.OutChannels > 0 {
+		ahead := int64(s.head-atomic.LoadUint64(&s.c.tail)) + int64(s.pipeFrames)
+		outNano = rt.Now() + ahead*int64(time.Second)/int64(s.rate)
+	}
+	return outNano, inNano
 }
 
 // Deadlines reports none: the render callback does not timestamp its wakes.
@@ -404,15 +529,19 @@ func (s *stream) Clock() (outNano, inNano int64) {
 //tymbal:rt
 func (s *stream) Deadlines() (wakeNano, commitNano int64) { return 0, 0 }
 
-// Dropouts counts render callbacks that found less data than Core Audio asked
-// for and filled the difference with silence.
+// Dropouts counts output underruns and input overflows. Missing input is never
+// replaced with silence; Recover explicitly discards an overflowed queue.
 //
 //tymbal:rt
 func (s *stream) Dropouts() uint64 {
 	if s.closed.Load() {
 		return s.finalUnder
 	}
-	return atomic.LoadUint64(&s.c.under)
+	n := atomic.LoadUint64(&s.c.under)
+	if s.input != nil {
+		n += atomic.LoadUint64(&s.input.c.overflows)
+	}
+	return n
 }
 
 // Recover does nothing. After an underrun the ring is simply empty, and the
@@ -420,7 +549,20 @@ func (s *stream) Dropouts() uint64 {
 // is room.
 //
 //tymbal:rt
-func (s *stream) Recover() error { return nil }
+func (s *stream) Recover() error {
+	if s.input != nil && atomic.LoadUint64(&s.input.c.paused) != 0 {
+		s.input.recover()
+	}
+	return nil
+}
+
+//tymbal:rt
+func (s *stream) ClockSample() driver.ClockSample {
+	if s.input != nil && !s.closed.Load() {
+		return s.input.pending
+	}
+	return driver.ClockSample{}
+}
 
 // Stop stops the unit. When AudioOutputUnitStop returns the render callback has
 // finished its last call and will not run again.
@@ -473,7 +615,13 @@ func (s *stream) Close() error {
 		}
 		s.unit = 0
 	}
-	s.finalUnder = atomic.LoadUint64(&s.c.under)
+	if s.ownedAggregate != 0 {
+		if err := check("AudioHardwareDestroyAggregateDevice", destroyAggregateDevice(s.ownedAggregate)); err != nil && first == nil {
+			first = err
+		}
+		s.ownedAggregate = 0
+	}
+	s.finalUnder = s.Dropouts()
 	s.wakeMu.Lock()
 	s.closed.Store(true)
 	sem := s.sem
@@ -481,6 +629,11 @@ func (s *stream) Close() error {
 	s.wakeMu.Unlock()
 	if sem != 0 {
 		if err := check("semaphore_destroy", semaphoreDestroy(s.task, sem)); err != nil && first == nil {
+			first = err
+		}
+	}
+	if s.input != nil {
+		if err := s.input.arena.Close(); err != nil && first == nil {
 			first = err
 		}
 	}

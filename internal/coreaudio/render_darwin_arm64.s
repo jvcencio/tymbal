@@ -13,7 +13,7 @@
 // It moves frames from the ring into ioData and returns, so the Go thread can
 // refill it:
 //
-//	if first call and sigmask != 0: block process signals on this thread
+//	if sigmask != 0: block process signals on this thread
 //	require one buffer with storage            else bad++, return 0
 //	req   = min(nframes, buffer bytes / fbytes)
 //	n     = min(req, head - tail)              head loaded with acquire
@@ -42,9 +42,7 @@ TEXT ·render(SB), NOSPLIT|NOFRAME, $0-0
 	MOVD	R5, R20			// ioData
 	MOVWU	R4, R22			// nframes
 
-	// First call: block process signals on this thread (see blockedSignals).
-	MOVD	ctrl_masked(R19), R9
-	CBNZ	R9, masked
+	// Block process signals on every callback: HAL may replace its IO thread (see blockedSignals).
 	MOVD	ctrl_sigmask(R19), R9
 	CBZ	R9, masked
 	MOVD	$1, R10

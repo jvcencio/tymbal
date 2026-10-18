@@ -1,10 +1,11 @@
 //go:build darwin && (amd64 || arm64)
 
-// Package coreaudio implements macOS Core Audio endpoint discovery and AUHAL
-// output streams without cgo and without a run-time FFI library. It does not
+// Package coreaudio implements macOS Core Audio discovery and AUHAL input,
+// output, and duplex streams without cgo or a run-time FFI library. It does not
 // use cgo, so there is no C preamble and no C compiler in the build. It does
-// not use a dlopen-style loader library such as ebitengine's either. It builds
-// with CGO_ENABLED=0, and cross-compiles from any host.
+// use a third-party loader. Microphone authorization loads Apple's AVFoundation
+// on the control path; Core Audio calls remain load-time imports. It builds
+// with CGO_ENABLED=0 and cross-compiles from any host.
 //
 // # Calling Core Audio
 //
@@ -77,12 +78,20 @@
 //
 // # Status
 //
-// Output only, on the default or any other output device, at the device's
-// current nominal sample rate, as interleaved Float32. Not yet implemented:
-// input and duplex streams, device-change events (Watch), the IO workgroup,
-// and the ten-minute soak that gates them. TestNativeRenderSoak in the root
-// package runs any shorter soak: TYMBAL_NATIVE_DURATION=60s at the default
-// 128-frame period.
+// Input, output, and duplex use the selected devices' current matching sample
+// rate as interleaved Float32. Separate input and output devices share a private
+// aggregate whose master is the input clock. Physical device rates and system
+// defaults stay unchanged. Native input timestamps accompany raw samples;
+// discontinuities stop the stream rather than inventing continuous audio.
+// InputAccess queries permission without opening or prompting. Only an explicit
+// RequestInputAccess may prompt; Open requires granted access.
+//
+// Device loss, rate changes, and permission revocation stop active input. Public
+// device-change events (Watch) and IO workgroups are not implemented. Software
+// capture protocol tests run on both architectures. Microphone hardware needs
+// explicit local authorization and qualification; CI never requests access.
+// TestNativeRenderSoak runs output soaks with TYMBAL_NATIVE_DURATION=60s (or
+// longer) at the default 128-frame period.
 //
 // # Linking
 //
@@ -101,6 +110,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -180,7 +190,7 @@ func (*backend) Devices() ([]driver.Info, error) {
 	infos := make([]driver.Info, 0, len(ids))
 	for _, id := range ids {
 		info, ok := describeDevice(id)
-		if !ok {
+		if !ok || strings.HasPrefix(info.ID, privateAggregatePrefix) {
 			continue // gone between the two calls, or has no audio streams
 		}
 		if id == defOut {
@@ -228,95 +238,127 @@ func (*backend) Watch(fn func(driver.Event)) (stop func()) {
 	return func() {}
 }
 
-// Open creates an AUHAL output stream on req.Output at the device's current
-// sample rate.
-//
-// It asks the HAL for an IO buffer of the requested period (clamped to the
-// device's range), because a small period is only worth having if the device's
-// cycle is small too. That request belongs to this process: another process
-// still reads the old size, and it ends with the process. Open never changes
-// the device's sample rate; a request for another rate fails with
-// driver.ErrFormat.
+// Open negotiates input, output or duplex at the devices' current sample
+// rate. It never changes a physical device's rate or the system defaults.
 func (*backend) Open(req driver.Request) (driver.Stream, error) {
-	switch {
-	case req.Input != nil:
-		return nil, fmt.Errorf("%w: coreaudio input and duplex streams are not implemented", driver.ErrUnsupported)
-	case req.Output == nil:
-		return nil, fmt.Errorf("%w: coreaudio needs an output device", driver.ErrUnsupported)
-	case req.Exclusive:
+	if req.Input == nil && req.Output == nil {
+		return nil, fmt.Errorf("%w: coreaudio needs an input or output device", driver.ErrUnsupported)
+	}
+	if req.Exclusive {
 		return nil, fmt.Errorf("%w: coreaudio exclusive (hog) mode is not implemented", driver.ErrUnsupported)
-	case req.OutChannels <= 0 || req.SampleRate <= 0 || req.Period <= 0 || req.Periods <= 0 || req.InChannels != 0:
+	}
+	if req.SampleRate <= 0 || req.Period <= 0 || req.Periods <= 0 || req.OutChannels < 0 || req.InChannels < 0 ||
+		(req.Output == nil) != (req.OutChannels == 0) || (req.Input == nil) != (req.InChannels == 0) {
 		return nil, driver.ErrFormat
-	case req.Period > maxRingFrames || req.Periods > maxRingFrames:
-		return nil, errRingGeometry // also keeps Period*Periods from overflowing
+	}
+	if req.Period > maxRingFrames || req.Periods > maxRingFrames || req.OutChannels > maxChannels || req.InChannels > maxChannels {
+		return nil, errRingGeometry
 	}
 	initHAL()
-	id, err := deviceByUID(req.Output.ID)
-	if err != nil {
+	var output, input uint32
+	resolve := func(info *driver.Info, scope uint32, channels int) (uint32, error) {
+		if info == nil {
+			return 0, nil
+		}
+		id, err := deviceByUID(info.ID)
+		if err != nil {
+			return 0, err
+		}
+		nominal, err := f64Prop(id, selNominalSampleRate, scopeGlobal)
+		if err != nil {
+			return 0, classify(err)
+		}
+		if rate := int(math.Round(nominal)); rate != req.SampleRate {
+			return 0, fmt.Errorf("%w: %q runs at %d Hz; requested %d Hz", driver.ErrFormat, info.Name, rate, req.SampleRate)
+		}
+		if available := channelCount(id, scope); channels > available {
+			return 0, fmt.Errorf("%w: %q has %d channels, requested %d", driver.ErrFormat, info.Name, available, channels)
+		}
+		return id, nil
+	}
+	var err error
+	if output, err = resolve(req.Output, scopeOutput, req.OutChannels); err != nil {
 		return nil, err
 	}
-
-	nominal, err := f64Prop(id, selNominalSampleRate, scopeGlobal)
-	if err != nil {
-		return nil, classify(err)
+	if input, err = resolve(req.Input, scopeInput, req.InChannels); err != nil {
+		return nil, err
 	}
-	rate := int(math.Round(nominal))
-	if rate != req.SampleRate {
-		return nil, fmt.Errorf("%w: %q runs at %d Hz and tymbal does not change a device's sample rate; requested %d Hz",
-			driver.ErrFormat, req.Output.Name, rate, req.SampleRate)
+	if input != 0 {
+		access, err := nativeInputAccess()
+		if err != nil {
+			return nil, err
+		}
+		if access != driver.InputAccessGranted {
+			return nil, errMicrophoneAccess
+		}
 	}
-	if outs := channelCount(id, scopeOutput); req.OutChannels > outs {
-		return nil, fmt.Errorf("%w: %q has %d output channels, requested %d", driver.ErrFormat, req.Output.Name, outs, req.OutChannels)
+	device := output
+	if device == 0 {
+		device = input
 	}
-
-	// Period. The Go render period is free to differ from the device's IO
-	// buffer, since the ring decouples them, but the point of asking for a
-	// small one is a small device buffer too.
+	var aggregate uint32
+	inputOffset := 0
+	if input != 0 && output != 0 && input != output {
+		inputOffset = channelCount(output, scopeInput)
+		aggregate, err = newDuplexDevice(req.Output.ID, req.Input.ID, req.OutChannels, inputOffset+req.InChannels)
+		if err != nil {
+			return nil, err
+		}
+		device = aggregate
+	}
 	period := req.Period
-	if lo, hi := bufferRange(id); hi > 0 {
+	if lo, hi := bufferRange(device); hi > 0 {
 		period = max(lo, min(period, hi))
 	}
 	deviceFrames := period
 	want := uint32(period)
-	if cur, err := u32Prop(id, selBufferFrameSize, scopeGlobal); err != nil || cur != want {
-		_ = audioObjectSetPropertyData(id, selBufferFrameSize, scopeGlobal, 4, unsafe.Pointer(&want))
-		if got, err := u32Prop(id, selBufferFrameSize, scopeGlobal); err == nil && got > 0 {
+	if cur, err := u32Prop(device, selBufferFrameSize, scopeGlobal); err != nil || cur != want {
+		_ = audioObjectSetPropertyData(device, selBufferFrameSize, scopeGlobal, 4, unsafe.Pointer(&want))
+		if got, err := u32Prop(device, selBufferFrameSize, scopeGlobal); err == nil && got > 0 {
 			deviceFrames = int(got)
 		}
 	} else {
 		deviceFrames = int(cur)
 	}
-
-	// Frames between the ring and the speaker: the IO buffer being played, the
-	// device and stream latency, and the safety offset the HAL keeps ahead.
-	pipe := deviceFrames
-	for _, p := range []uint32{selDeviceLatency, selSafetyOffset} {
-		if v, err := u32Prop(id, p, scopeOutput); err == nil {
-			pipe += int(v)
-		}
-	}
-	if streams, err := u32sProp(id, selDeviceStreams, scopeOutput); err == nil && len(streams) > 0 {
-		if v, err := u32Prop(streams[0], selDeviceLatency, scopeGlobal); err == nil {
-			pipe += int(v)
-		}
-	}
-
-	// Frames kept queued ahead of Core Audio. At least the requested number of
-	// periods, and always room for one device buffer plus a period of slack.
 	fill := max(req.Periods, 2) * period
 	if floor := deviceFrames + period; fill < floor {
 		fill = (floor + period - 1) / period * period
 	}
-
-	s, err := newStream(streamConfig{rate: rate, channels: req.OutChannels, period: period, fill: fill, pipeFrames: pipe})
+	pipeOut, pipeIn := 0, 0
+	if output != 0 {
+		pipeOut = devicePipelineFrames(device, scopeOutput, deviceFrames)
+	}
+	if input != 0 {
+		pipeIn = devicePipelineFrames(device, scopeInput, deviceFrames)
+	}
+	s, err := newStream(streamConfig{rate: req.SampleRate, channels: req.OutChannels, inputChannels: req.InChannels, period: period, fill: fill, pipeFrames: pipeOut, inputPipeFrames: pipeIn, maxInputFrames: deviceFrames, inputOffset: inputOffset})
 	if err != nil {
+		if aggregate != 0 {
+			_ = destroyAggregateDevice(aggregate)
+		}
 		return nil, err
 	}
-	if err := s.attachUnit(id); err != nil {
+	s.inputDevice, s.outputDevice, s.ownedAggregate = input, output, aggregate
+	if err := s.attachUnit(device); err != nil {
 		_ = s.Close()
 		return nil, classify(err)
 	}
 	return s, nil
+}
+
+func devicePipelineFrames(device, scope uint32, bufferFrames int) int {
+	frames := bufferFrames
+	for _, property := range []uint32{selDeviceLatency, selSafetyOffset} {
+		if value, err := u32Prop(device, property, scope); err == nil {
+			frames += int(value)
+		}
+	}
+	if streams, err := u32sProp(device, selDeviceStreams, scope); err == nil && len(streams) > 0 {
+		if value, err := u32Prop(streams[0], selDeviceLatency, scopeGlobal); err == nil {
+			frames += int(value)
+		}
+	}
+	return frames
 }
 
 var _ driver.Driver = (*backend)(nil)

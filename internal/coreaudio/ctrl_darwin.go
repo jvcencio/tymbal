@@ -41,7 +41,7 @@ type ctrl struct {
 	memset  uintptr // memset
 	sigmask uintptr // pthread_sigmask, or 0 to leave the render thread's signal mask alone
 	sigset  uint64  // signals to block on the render thread (a darwin sigset_t, in the low word)
-	masked  uint64  // set by the trampoline once it has blocked sigset
+	masked  uint64  // reports that the trampoline has blocked sigset
 
 	// Counters, written only by the trampoline and read atomically by Go.
 	calls       uint64 // callbacks served
