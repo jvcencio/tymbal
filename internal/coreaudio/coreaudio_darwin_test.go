@@ -217,8 +217,12 @@ func TestSmokeSine(t *testing.T) {
 		frame += p.Period
 	}
 
-	// Wait wakes when the callback has made room, so by now the callback has
-	// consumed everything up to the flush: the whole tone went to Core Audio.
+	// Stop before comparing counters: the device may consume another period
+	// while logging or inspecting a live counter, especially on a loaded VM.
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// Wait consumed everything up to the flush: the whole tone went to Core Audio.
 	calls, under, underFrames, bad := s.counters()
 	tail := atomic.LoadUint64(&s.c.tail)
 	t.Logf("render callbacks: %d, short: %d (%d frames), rejected: %d; consumed %d of %d frames committed; longest Wait %s",
@@ -239,9 +243,6 @@ func TestSmokeSine(t *testing.T) {
 		t.Errorf("Clock() = %d, %d", outNano, inNano)
 	}
 
-	if err := s.Stop(); err != nil {
-		t.Errorf("Stop: %v", err)
-	}
 	if err := s.Stop(); err != nil {
 		t.Errorf("second Stop: %v", err)
 	}

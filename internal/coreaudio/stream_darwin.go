@@ -433,15 +433,18 @@ func (s *stream) Stop() error {
 }
 
 func (s *stream) stopLocked() error {
+	// Stop the device before joining housekeeping, so a slow HAL health
+	// query cannot drain the render ring and manufacture shutdown underruns.
+	var stopErr error
+	if !s.stopped.Swap(true) && s.started.Load() && s.unit != 0 {
+		stopErr = classify(check("AudioOutputUnitStop", audioOutputUnitStop(s.unit)))
+	}
 	if s.watchStop != nil {
 		close(s.watchStop)
 		<-s.watchDone
 		s.watchStop, s.watchDone = nil, nil
 	}
-	if s.stopped.Swap(true) || !s.started.Load() || s.unit == 0 {
-		return nil
-	}
-	return classify(check("AudioOutputUnitStop", audioOutputUnitStop(s.unit)))
+	return stopErr
 }
 
 // Close stops the unit if it is running, disposes it, destroys the semaphore
