@@ -51,14 +51,17 @@ type captureStager struct {
 	ready       bool
 	dropouts    uint64
 
-	stageDevicePosition      uint64
-	stageDevicePositionValid bool
-	expectedDevicePosition   uint64
-	expectedDevicePositionOK bool
-	stageQPCPosition         uint64
-	stageQPCPositionValid    bool
-	activeQPCPosition        uint64
-	activeQPCPositionValid   bool
+	stageDevicePosition       uint64
+	stageDevicePositionValid  bool
+	expectedDevicePosition    uint64
+	expectedDevicePositionOK  bool
+	havePacket                bool
+	stageQPCPosition          uint64
+	stageQPCPositionValid     bool
+	activeDevicePosition      uint64
+	activeDevicePositionValid bool
+	activeQPCPosition         uint64
+	activeQPCPositionValid    bool
 }
 
 // captureStream contains plain negotiated data until Start. Start creates
@@ -68,6 +71,7 @@ type captureStream struct {
 	params   driver.Params
 	wave     []byte
 	stager   captureStager
+	loopback bool
 
 	enumerator     uintptr
 	device         uintptr
@@ -100,6 +104,22 @@ type captureStream struct {
 var _ driver.Stream = (*captureStream)(nil)
 
 func openCaptureStream(req driver.Request) (driver.Stream, error) {
+	return openCaptureStreamMode(req, false)
+}
+
+func openLoopbackCaptureStream(req driver.Request) (driver.Stream, error) {
+	if req.Output == nil || req.Exclusive || req.OutChannels <= 0 {
+		return nil, driver.ErrUnsupported
+	}
+	loopbackReq := req
+	loopbackReq.Input = req.Output
+	loopbackReq.InChannels = req.OutChannels
+	loopbackReq.Output = nil
+	loopbackReq.OutChannels = 0
+	return openCaptureStreamMode(loopbackReq, true)
+}
+
+func openCaptureStreamMode(req driver.Request, loopback bool) (driver.Stream, error) {
 	if req.Exclusive {
 		return openExclusiveCaptureStream(req)
 	}
@@ -110,7 +130,7 @@ func openCaptureStream(req driver.Request) (driver.Stream, error) {
 		return nil, driver.ErrFormat
 	}
 
-	probe, err := withSTA(func() (captureProbe, error) { return probeCapture(req) })
+	probe, err := withSTA(func() (captureProbe, error) { return probeCapture(req, loopback) })
 	if err != nil {
 		return nil, err
 	}
@@ -128,11 +148,12 @@ func openCaptureStream(req driver.Request) (driver.Stream, error) {
 		params:       params,
 		wave:         probe.formatBytes,
 		stager:       *stager,
+		loopback:     loopback,
 		bufferFrames: probe.bufferFrames,
 	}, nil
 }
 
-func probeCapture(req driver.Request) (captureProbe, error) {
+func probeCapture(req driver.Request, loopback bool) (captureProbe, error) {
 	enumerator, err := createEnumerator()
 	if err != nil {
 		return captureProbe{}, err
@@ -181,7 +202,7 @@ func probeCapture(req driver.Request) (captureProbe, error) {
 		return captureProbe{}, err
 	}
 	defer closeEvent(event)
-	if err := initializeShared(client, mixFormat, period); err != nil {
+	if err := initializeCaptureShared(client, mixFormat, period, rate, loopback); err != nil {
 		return captureProbe{}, classifyInitializeError(err)
 	}
 	if err := setAudioEvent(client, event); err != nil {
@@ -191,20 +212,22 @@ func probeCapture(req driver.Request) (captureProbe, error) {
 	if err != nil {
 		return captureProbe{}, err
 	}
-	currentFormat, currentPeriod, err := getCurrentSharedEnginePeriod(client)
-	if err != nil {
-		return captureProbe{}, err
-	}
-	defer procCoTaskMemFree.Call(currentFormat)
-	if currentPeriod != period {
-		return captureProbe{}, fmt.Errorf("%w: WASAPI granted period %d, selected %d", driver.ErrFormat, currentPeriod, period)
-	}
-	currentBytes, _, currentChannels, currentRate, err := describeWaveFormat(currentFormat)
-	if err != nil {
-		return captureProbe{}, err
-	}
-	if currentRate != rate || currentChannels != channels || !equalBytes(currentBytes, waveBytes) {
-		return captureProbe{}, fmt.Errorf("%w: WASAPI shared engine format changed during negotiation", driver.ErrFormat)
+	if !loopback {
+		currentFormat, currentPeriod, currentErr := getCurrentSharedEnginePeriod(client)
+		if currentErr != nil {
+			return captureProbe{}, currentErr
+		}
+		defer procCoTaskMemFree.Call(currentFormat)
+		if currentPeriod != period {
+			return captureProbe{}, fmt.Errorf("%w: WASAPI granted period %d, selected %d", driver.ErrFormat, currentPeriod, period)
+		}
+		currentBytes, _, currentChannels, currentRate, describeErr := describeWaveFormat(currentFormat)
+		if describeErr != nil {
+			return captureProbe{}, describeErr
+		}
+		if currentRate != rate || currentChannels != channels || !equalBytes(currentBytes, waveBytes) {
+			return captureProbe{}, fmt.Errorf("%w: WASAPI shared engine format changed during negotiation", driver.ErrFormat)
+		}
 	}
 	periodCount, _, err := captureBufferGeometry(bufferFrames, int(period), rate)
 	if err != nil {
@@ -324,7 +347,7 @@ func (s *captureStream) openOnStreamThread() error {
 	if err := createCaptureEvents(s); err != nil {
 		return err
 	}
-	if err := initializeShared(client, mixFormat, uint32(s.params.Period)); err != nil {
+	if err := initializeCaptureShared(client, mixFormat, uint32(s.params.Period), s.params.SampleRate, s.loopback); err != nil {
 		return classifyInitializeError(err)
 	}
 	if err := setAudioEvent(client, s.audioEvent); err != nil {
@@ -348,20 +371,22 @@ func (s *captureStream) openOnStreamThread() error {
 	if periodCount != s.params.Periods || latency != s.params.LatencyIn {
 		return fmt.Errorf("%w: WASAPI capture buffer geometry or stream latency changed after Open", driver.ErrFormat)
 	}
-	currentFormat, currentPeriod, err := getCurrentSharedEnginePeriod(client)
-	if err != nil {
-		return err
-	}
-	defer procCoTaskMemFree.Call(currentFormat)
-	if currentPeriod != uint32(s.params.Period) {
-		return fmt.Errorf("%w: WASAPI granted period %d, requested %d", driver.ErrFormat, currentPeriod, s.params.Period)
-	}
-	currentBytes, _, currentChannels, currentRate, err := describeWaveFormat(currentFormat)
-	if err != nil {
-		return err
-	}
-	if currentRate != s.params.SampleRate || currentChannels != s.params.InChannels || !equalBytes(currentBytes, s.wave) {
-		return fmt.Errorf("%w: WASAPI shared engine format changed after Open", driver.ErrFormat)
+	if !s.loopback {
+		currentFormat, currentPeriod, currentErr := getCurrentSharedEnginePeriod(client)
+		if currentErr != nil {
+			return currentErr
+		}
+		defer procCoTaskMemFree.Call(currentFormat)
+		if currentPeriod != uint32(s.params.Period) {
+			return fmt.Errorf("%w: WASAPI granted period %d, requested %d", driver.ErrFormat, currentPeriod, s.params.Period)
+		}
+		currentBytes, _, currentChannels, currentRate, describeErr := describeWaveFormat(currentFormat)
+		if describeErr != nil {
+			return describeErr
+		}
+		if currentRate != s.params.SampleRate || currentChannels != s.params.InChannels || !equalBytes(currentBytes, s.wave) {
+			return fmt.Errorf("%w: WASAPI shared engine format changed after Open", driver.ErrFormat)
+		}
 	}
 	capture, err := getCaptureClient(client)
 	if err != nil {
@@ -369,6 +394,31 @@ func (s *captureStream) openOnStreamThread() error {
 	}
 	s.capture = capture
 	return nil
+}
+
+func initializeCaptureShared(client, wave uintptr, period uint32, rate int, loopback bool) error {
+	if loopback {
+		return initializeLoopbackShared(client, wave, period, rate)
+	}
+	return initializeShared(client, wave, period)
+}
+
+func initializeLoopbackShared(client, wave uintptr, period uint32, rate int) error {
+	if period == 0 || period > ^uint32(0)/2 || rate <= 0 {
+		return fmt.Errorf("%w: invalid loopback buffer geometry", driver.ErrFormat)
+	}
+	bufferHNS, ok := framesToHNS(uint64(period)*2, uint32(rate))
+	if !ok || bufferHNS <= 0 {
+		return fmt.Errorf("%w: loopback buffer duration overflows", driver.ErrFormat)
+	}
+	hr := comCall6(client, audioClientInitialize,
+		uintptr(audclntShareModeShared),
+		uintptr(audclntStreamEventCallback|audclntStreamLoopback),
+		uintptr(bufferHNS),
+		0,
+		wave,
+		0)
+	return checkHRESULT("IAudioClient.Initialize(loopback)", hr)
 }
 
 func createCaptureEvents(s *captureStream) error {
@@ -399,19 +449,14 @@ func (s *captureStream) Wait() error {
 	if s.stager.ready {
 		return fmt.Errorf("tymbal wasapi: wait before committing the previous capture period")
 	}
-	if s.interruptRequested.Load() {
-		return driver.ErrInterrupted
-	}
-	if s.stager.preparePeriod() {
-		return nil
-	}
-	if err := s.drainCapturePackets(); err != nil {
-		return err
-	}
-	if s.stager.preparePeriod() {
-		return nil
-	}
 	for {
+		ready, err := s.pollReady()
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
 		result, _, callErr := syscall.SyscallN(s.waitProc,
 			2,
 			uintptr(unsafe.Pointer(&s.waitHandles[0])),
@@ -431,13 +476,22 @@ func (s *captureStream) Wait() error {
 		if result != waitObject0 {
 			return fmt.Errorf("tymbal wasapi: unexpected capture wait result 0x%08X", uint32(result))
 		}
-		if err := s.drainCapturePackets(); err != nil {
-			return err
-		}
-		if s.stager.preparePeriod() {
-			return nil
-		}
 	}
+}
+
+// pollReady drains available capture packets without blocking, allowing duplex
+// to wait on both endpoint events from a single locked stream thread.
+func (s *captureStream) pollReady() (bool, error) {
+	if s.interruptRequested.Load() {
+		return false, driver.ErrInterrupted
+	}
+	if s.stager.preparePeriod() {
+		return true, nil
+	}
+	if err := s.drainCapturePackets(); err != nil {
+		return false, err
+	}
+	return s.stager.preparePeriod(), nil
 }
 
 func (s *captureStream) drainCapturePackets() error {
@@ -533,6 +587,18 @@ func (s *captureStream) Clock() (outNano, inNano int64) {
 		return 0, 0
 	}
 	return 0, qpcNano + s.qpcOffsetNano
+}
+
+func (s *captureStream) ClockSample() driver.ClockSample {
+	_, inNano := s.Clock()
+	if !s.stager.activeDevicePositionValid {
+		return driver.ClockSample{InputQPCNano: inNano}
+	}
+	return driver.ClockSample{
+		InputPosition:  s.stager.activeDevicePosition,
+		InputFrequency: uint64(s.params.SampleRate),
+		InputQPCNano:   inNano,
+	}
 }
 
 func (s *captureStream) Deadlines() (wakeNano, commitNano int64) { return 0, 0 }
@@ -677,7 +743,7 @@ func (s *captureStager) appendPacket(packet []byte, frames int, flags uint32, de
 		return fmt.Errorf("%w: short capture packet", driver.ErrFormat)
 	}
 	positionValid := flags&audclntCaptureBufferFlagTimestampError == 0
-	discontinuity := flags&audclntCaptureBufferFlagDataDiscontinuity != 0
+	discontinuity := s.havePacket && flags&audclntCaptureBufferFlagDataDiscontinuity != 0
 	if positionValid && s.expectedDevicePositionOK && devicePosition != s.expectedDevicePosition {
 		discontinuity = true
 	}
@@ -718,6 +784,7 @@ func (s *captureStager) appendPacket(packet []byte, frames int, flags uint32, de
 	} else {
 		s.expectedDevicePositionOK = false
 	}
+	s.havePacket = true
 	return nil
 }
 
@@ -729,6 +796,8 @@ func (s *captureStager) preparePeriod() bool {
 	copy(s.input, s.data[:periodBytes])
 	s.activeQPCPosition = s.stageQPCPosition
 	s.activeQPCPositionValid = s.stageQPCPositionValid
+	s.activeDevicePosition = s.stageDevicePosition
+	s.activeDevicePositionValid = s.stageDevicePositionValid
 	s.ready = true
 	return true
 }
@@ -752,6 +821,7 @@ func (s *captureStager) commitPeriod() {
 		s.stageQPCPositionValid = false
 	}
 	s.activeQPCPositionValid = false
+	s.activeDevicePositionValid = false
 	s.ready = false
 }
 
@@ -760,6 +830,7 @@ func (s *captureStager) resetStage() {
 	s.ready = false
 	s.stageDevicePositionValid = false
 	s.stageQPCPositionValid = false
+	s.activeDevicePositionValid = false
 	s.activeQPCPositionValid = false
 }
 
@@ -767,6 +838,7 @@ func (s *captureStager) reset(clearPosition bool) {
 	s.resetStage()
 	if clearPosition {
 		s.expectedDevicePositionOK = false
+		s.havePacket = false
 	}
 }
 

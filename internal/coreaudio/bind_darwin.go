@@ -102,6 +102,10 @@ var (
 // Go memory may therefore be passed to a call that does not retain it. Memory
 // that C keeps after the call returns lives in a ring.Arena instead.
 
+// The ABI bridge itself does not allocate. Real-time callers must still choose
+// a bounded, real-time-safe system function (currently semaphore_timedwait).
+//
+//tymbal:rt
 //go:noescape
 func syscall_syscall(fn, a1, a2, a3 uintptr) (r1, r2 uintptr, err syscall.Errno)
 
@@ -313,6 +317,8 @@ func semaphoreSignal(sem uint32) int32 {
 // semaphoreTimedWait is semaphore_timedwait(sem, mach_timespec_t{sec, nsec}).
 // The struct is eight bytes and travels by value in one register, with tv_sec
 // in the low word. It returns 0, kernTimedOut, kernAborted or an error.
+//
+//tymbal:rt
 func semaphoreTimedWait(sem uint32, d time.Duration) int32 {
 	if d < 0 {
 		d = 0

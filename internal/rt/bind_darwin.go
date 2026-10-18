@@ -28,6 +28,7 @@ import (
 //go:cgo_import_dynamic tymbal_rt_mach_timebase_info mach_timebase_info "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic tymbal_rt_thread_policy_set thread_policy_set "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic tymbal_rt_thread_policy_get thread_policy_get "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic tymbal_rt_nanosleep nanosleep "/usr/lib/libSystem.B.dylib"
 
 // fn* hold the address of each import's trampoline. bind_darwin.s defines
 // them with DATA directives; Go never assigns them.
@@ -37,6 +38,7 @@ var (
 	fnmach_timebase_info     uintptr
 	fnthread_policy_set      uintptr
 	fnthread_policy_get      uintptr
+	fnnanosleep              uintptr
 )
 
 // Runtime gateways: switch to the thread's system stack, call fn with the C

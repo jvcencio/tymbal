@@ -38,9 +38,15 @@ func TestCaptureStagerAssemblesVariablePacketsIntoWholePeriods(t *testing.T) {
 	if stager.activeQPCPosition != 1000 || !stager.activeQPCPositionValid {
 		t.Fatalf("first period QPC = (%d, %v), want (1000, true)", stager.activeQPCPosition, stager.activeQPCPositionValid)
 	}
+	if stager.activeDevicePosition != 100 || !stager.activeDevicePositionValid {
+		t.Fatalf("first period device position = (%d, %v), want (100, true)", stager.activeDevicePosition, stager.activeDevicePositionValid)
+	}
 	stager.commitPeriod()
 	if stager.frames != 1 || stager.stageDevicePosition != 104 || stager.stageQPCPosition != 1004 {
 		t.Fatalf("after first commit: frames=%d device=%d qpc=%d, want 1/104/1004", stager.frames, stager.stageDevicePosition, stager.stageQPCPosition)
+	}
+	if stager.activeDevicePositionValid {
+		t.Fatal("committed period retained an active device position")
 	}
 	if err := stager.appendPacket([]byte{10, 11, 12, 13, 14, 15}, 3, 0, 105, 1005); err != nil {
 		t.Fatal(err)
@@ -101,6 +107,26 @@ func TestCaptureStagerSilenceDiscontinuityAndTimestampError(t *testing.T) {
 	}
 }
 
+func TestCaptureStagerIgnoresDiscontinuityOnFirstPacket(t *testing.T) {
+	stager, err := newCaptureStager(8, 2, 2, 48_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagged := uint32(audclntCaptureBufferFlagDataDiscontinuity)
+	if err := stager.appendPacket([]byte{1, 2, 3, 4}, 2, flagged, 10, 100); err != nil {
+		t.Fatal(err)
+	}
+	if stager.dropouts != 0 {
+		t.Fatalf("first packet discontinuity counted %d dropouts, want 0", stager.dropouts)
+	}
+	if err := stager.appendPacket([]byte{5, 6, 7, 8}, 2, flagged, 12, 102); err != nil {
+		t.Fatal(err)
+	}
+	if stager.dropouts != 1 {
+		t.Fatalf("later packet discontinuity counted %d dropouts, want 1", stager.dropouts)
+	}
+}
+
 func TestCaptureStagerDetectsDevicePositionGap(t *testing.T) {
 	stager, err := newCaptureStager(8, 4, 1, 48_000)
 	if err != nil {
@@ -130,16 +156,32 @@ func TestCaptureBufferGeometryAllowsVariablePacketQuantum(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsDuplexCaptureUntilSharedClockExists(t *testing.T) {
+func TestOpenRejectsExclusiveDuplexBeforeCOM(t *testing.T) {
 	input := &driver.Info{ID: "capture"}
 	output := &driver.Info{ID: "render"}
 	_, err := New().Open(driver.Request{
 		Input: input, Output: output,
 		InChannels: 2, OutChannels: 2,
-		SampleRate: 48_000, Period: 480, Periods: 2,
+		SampleRate: 48_000, Period: 480, Periods: 2, Exclusive: true,
 	})
 	if !errors.Is(err, driver.ErrUnsupported) {
 		t.Fatalf("duplex Open error = %v, want driver.ErrUnsupported", err)
+	}
+}
+
+func TestValidateDuplexGeometry(t *testing.T) {
+	base := driver.Params{SampleRate: 48_000, Period: 480, Periods: 2}
+	if err := validateDuplexGeometry(base, base); err != nil {
+		t.Fatalf("matching duplex geometry rejected: %v", err)
+	}
+	for _, render := range []driver.Params{
+		{SampleRate: 44_100, Period: 480, Periods: 2},
+		{SampleRate: 48_000, Period: 240, Periods: 2},
+		{SampleRate: 48_000, Period: 480, Periods: 3},
+	} {
+		if err := validateDuplexGeometry(base, render); !errors.Is(err, driver.ErrFormat) {
+			t.Errorf("mismatched duplex geometry error=%v, want driver.ErrFormat", err)
+		}
 	}
 }
 

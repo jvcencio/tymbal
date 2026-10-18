@@ -32,3 +32,8 @@ TEXT tymbal_rt_thread_policy_get_trampoline<>(SB),NOSPLIT,$0-0
 	JMP	tymbal_rt_thread_policy_get(SB)
 GLOBL	·fnthread_policy_get(SB), RODATA, $8
 DATA	·fnthread_policy_get(SB)/8, $tymbal_rt_thread_policy_get_trampoline<>(SB)
+
+TEXT tymbal_rt_nanosleep_trampoline<>(SB),NOSPLIT,$0-0
+	JMP	tymbal_rt_nanosleep(SB)
+GLOBL	·fnnanosleep(SB), RODATA, $8
+DATA	·fnnanosleep(SB)/8, $tymbal_rt_nanosleep_trampoline<>(SB)

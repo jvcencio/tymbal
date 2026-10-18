@@ -82,6 +82,34 @@ func newTestStream(t *testing.T, channels, period, fill int) *stream {
 
 func semaphorePending(s *stream) bool { return semaphoreTimedWait(s.sem, 20*time.Millisecond) == 0 }
 
+func TestDeviceWatchJoinsOnStopAndLostDeviceFailsWithoutAllocating(t *testing.T) {
+	s := newTestStream(t, 2, 64, 128)
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s.startDeviceWatch()
+	done := s.watchDone
+	s.deviceLost.Store(true)
+	if allocs := testing.AllocsPerRun(100, func() {
+		if err := s.Wait(); err != driver.ErrLost {
+			panic("lost device was not reported")
+		}
+	}); allocs != 0 {
+		t.Fatalf("lost-device handling allocated %g objects", allocs)
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("device watcher survived stream stop")
+	}
+	if s.watchStop != nil || s.watchDone != nil {
+		t.Fatal("stopped stream retained its device watcher")
+	}
+}
+
 func TestCtrlLayout(t *testing.T) {
 	var c ctrl
 	if got := unsafe.Offsetof(c.head); got != 0 {

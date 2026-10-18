@@ -73,6 +73,10 @@ type stream struct {
 	device      uint32  // AudioObjectID, 0 when no unit is attached
 	unit        uintptr // AUHAL AudioUnit, 0 when none
 	initialized bool    // AudioUnitInitialize succeeded
+	deviceLost  atomic.Bool
+	watchStop   chan struct{}
+	watchDone   chan struct{}
+	waitFailure semaphoreWaitError
 
 	wakeMu      sync.Mutex // orders Interrupt's semaphore_signal against Close's semaphore_destroy
 	interrupted atomic.Bool
@@ -121,6 +125,12 @@ func newStream(cfg streamConfig) (*stream, error) {
 	ctrlMem := arena.Take(ctrlSize, 64)
 	data := arena.Take(capacity*frameBytes, 64)
 
+	task := machTaskSelf()
+	var sem uint32
+	if err := check("semaphore_create", semaphoreCreate(task, &sem)); err != nil {
+		_ = arena.Close()
+		return nil, err
+	}
 	s := &stream{
 		arena:       arena,
 		c:           (*ctrl)(unsafe.Pointer(&ctrlMem[0])),
@@ -132,17 +142,14 @@ func newStream(cfg streamConfig) (*stream, error) {
 		fillMax:     uint64(cfg.fill),
 		pipeFrames:  cfg.pipeFrames,
 		rate:        cfg.rate,
-		task:        machTaskSelf(),
-	}
-	if err := check("semaphore_create", semaphoreCreate(s.task, &s.sem)); err != nil {
-		_ = arena.Close()
-		return nil, err
+		task:        task,
+		sem:         sem,
 	}
 	c := s.c
 	c.mask = uint64(capacity - 1)
 	c.fbytes = uint64(frameBytes)
 	c.data = uintptr(unsafe.Pointer(&data[0]))
-	c.sem = uint64(s.sem)
+	c.sem = uint64(sem)
 	c.signal = fnsemaphore_signal
 	c.memcpy = fnmemcpy
 	c.memset = fnmemset
@@ -248,6 +255,7 @@ func (s *stream) Start() error {
 			s.stopped.Store(true)
 			return classify(err)
 		}
+		s.startDeviceWatch()
 	}
 	s.started.Store(true)
 	return nil
@@ -265,6 +273,9 @@ func (s *stream) Wait() error {
 		return errWaitCommit
 	}
 	for {
+		if s.deviceLost.Load() {
+			return driver.ErrLost
+		}
 		if s.interrupted.Load() {
 			return driver.ErrInterrupted
 		}
@@ -277,13 +288,41 @@ func (s *stream) Wait() error {
 			// Signalled by the render callback or by Interrupt, or a signal
 			// interrupted the wait: look at the ring again.
 		case kernTimedOut:
-			if s.deviceGone() {
-				return driver.ErrLost
-			}
+			// Device discovery runs off the real-time stream thread.
 		default:
-			return fmt.Errorf("coreaudio: semaphore_timedwait failed: kern_return_t %d", kr)
+			s.waitFailure.status = kr
+			return &s.waitFailure
 		}
 	}
+}
+
+// Error formatting belongs to the caller, outside the real-time wait path.
+type semaphoreWaitError struct{ status int32 }
+
+func (e *semaphoreWaitError) Error() string {
+	return fmt.Sprintf("coreaudio: semaphore_timedwait failed: kern_return_t %d", e.status)
+}
+
+// AudioObjectGetPropertyData may block in the HAL. Keep it off the stream
+// thread, and join the watcher before destroying the device and its arena.
+func (s *stream) startDeviceWatch() {
+	s.watchStop, s.watchDone = make(chan struct{}), make(chan struct{})
+	ticker := time.NewTicker(waitSlice)
+	go func() {
+		defer close(s.watchDone)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.watchStop:
+				return
+			case <-ticker.C:
+				if s.deviceGone() {
+					s.deviceLost.Store(true)
+					return
+				}
+			}
+		}
+	}()
 }
 
 // deviceGone asks Core Audio whether the attached device has disappeared.
@@ -386,7 +425,7 @@ func (s *stream) Recover() error { return nil }
 // Stop stops the unit. When AudioOutputUnitStop returns the render callback has
 // finished its last call and will not run again.
 //
-//tymbal:rt
+// Stop is lifecycle cleanup after the real-time loop has finished.
 func (s *stream) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -394,6 +433,11 @@ func (s *stream) Stop() error {
 }
 
 func (s *stream) stopLocked() error {
+	if s.watchStop != nil {
+		close(s.watchStop)
+		<-s.watchDone
+		s.watchStop, s.watchDone = nil, nil
+	}
 	if s.stopped.Swap(true) || !s.started.Load() || s.unit == 0 {
 		return nil
 	}
