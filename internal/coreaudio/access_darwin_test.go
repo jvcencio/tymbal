@@ -32,6 +32,35 @@ func TestInputAccessQueryDoesNotRequestOrOpenInput(t *testing.T) {
 	}
 }
 
+func TestPermissionNativeCompletionWithExistingAccess(t *testing.T) {
+	access, err := nativeInputAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access != driver.InputAccessGranted {
+		t.Skip("never request a new permission in this test")
+	}
+	signal, err := newPermissionSignal(microphoneAPI.blockClass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := microphonePermission.begin(signal); err != nil {
+		_ = signal.arena.Close()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadUint64(&signal.result.state) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if result := atomic.LoadUint64(&signal.result.state); result != 2 {
+		// Keep the mmap valid if the native callback completes after timeout.
+		t.Fatalf("native already-authorized completion did not arrive: %d", result)
+	}
+	if err := signal.arena.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPermissionCompletionUsesNativeBlockABI(t *testing.T) {
 	signal, err := newPermissionSignal(0)
 	if err != nil {
